@@ -1,0 +1,5 @@
+# Apple's open-source array library: https://github.com/ml-explore/mlx
+# The version floor matters -- earlier releases returned silently incorrect
+# FFT results for transforms above 2^20 elements, with no error raised.
+mlx>=0.32.1
+numpy>=1.24
