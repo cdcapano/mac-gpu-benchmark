@@ -52,7 +52,7 @@ rm -rf /tmp/mac-gpu-benchmark
 
 ```bash
 cd /tmp
-git clone https://github.com/USER/mac-gpu-benchmark.git
+git clone https://github.com/cdcapano/mac-gpu-benchmark.git
 cd mac-gpu-benchmark
 python3 -m venv .venv
 source .venv/bin/activate
