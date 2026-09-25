@@ -720,14 +720,17 @@ def run_decompose(mx, ifft, args):
                 pass
         except Exception as exc:
             print(f"{nn:12d}   FAILED: {type(exc).__name__}: {exc}")
-    print("\nRead the sweep above the knee near 2^19; below it the numbers describe")
-    print("cache, not DRAM. Two complex64 arrays of 2^19 elements are 8.4 MB, which")
-    print("fits the 8 MB system level cache of a base M2, so smaller kernels are")
-    print("served from the SLC and run faster than main memory allows.")
-    print("SLC capacity is chip dependent -- 8 MB on a base part, up to 96 MB on an")
-    print("M1 Ultra -- and M3 and later merge the cache pools under Dynamic Caching,")
-    print("so the knee moves. Locate it on the machine in front of you rather than")
-    print("assuming 2^19. (Third-party microbenchmarks; Apple publishes no figures.)")
+    print("\nThe low-N rolloff is dispatch overhead. Measured on an M3 Pro, one")
+    print("model fits 20 points over 2^12..2^24 and two batch counts to a 3% median:")
+    print("a fixed per-eval floor of ~161 us plus bytes / 135.6 GB/s. Small arrays")
+    print("look slow because that floor is a large fraction of their runtime, and")
+    print("subtracting it leaves bandwidth flat from 2^19 to 2^24.")
+    print("This sweep says nothing about cache. It holds n_unique independent")
+    print("pairs resident to defeat cache reuse on purpose -- at 2^19 with the")
+    print("default that is ~100 MB, well past any SLC. Reading a cache size off")
+    print("this curve means reading the dispatch floor and calling it a cache.")
+    print("Resolving the cache hierarchy needs many iterations inside one kernel")
+    print("dispatch, or Metal counters; this instrument cannot see it.")
 
     out = dict(array_size=n, unit_bytes=unit, n_unique=k, rounds=args.rounds,
                times_s=t, implied_units=implied, ceiling_gbs=ceiling,
