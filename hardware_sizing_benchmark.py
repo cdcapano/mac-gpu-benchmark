@@ -107,6 +107,103 @@ def hostinfo():
 
 
 # ----------------------------------------------------------------------------
+# Background load. A process that streams memory steals bandwidth from the GPU,
+# because CPU and GPU sit behind the same memory controller. Measured on an
+# M3 Pro (25 Sep 2026): Mail and Spotlight indexing between them saturating two
+# cores moved bandwidth_check.py from 125-127 GB/s to 96-118 GB/s, and took
+# run-to-run reproducibility from 1.4% to 22%.
+#
+# CPU percentage is a proxy rather than the quantity that matters: two pure
+# spin loops at 100% CPU, touching no memory, changed the result by under 2%.
+# So a flagged machine is one to re-measure, and never one whose numbers can be
+# corrected upward by an assumed factor.
+# ----------------------------------------------------------------------------
+# Processes excluded from raising the alarm. Terminal emulators and the window
+# server burn CPU rendering this script's own output, so they fire on a machine
+# that is otherwise idle. They are still listed, since a genuinely busy display
+# does cost bandwidth -- they just do not by themselves mean "come back later".
+DISPLAY_PROCS = {"WindowServer", "Terminal", "iTerm2", "kitty", "Alacritty",
+                 "WezTerm", "Ghostty", "claude", "node"}
+
+BUSY_PROC_PCT = 20.0
+BUSY_LOAD_FRAC = 0.30
+
+
+def machine_load():
+    """(load1, ncpu, [(pcpu, name), ...]); this process excluded."""
+    def sysctl(key):
+        try:
+            return subprocess.check_output(["sysctl", "-n", key], text=True,
+                                           stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return ""
+    try:
+        load1 = float(sysctl("vm.loadavg").strip("{} ").split()[0])
+    except Exception:
+        load1 = None
+    try:
+        ncpu = int(sysctl("hw.ncpu"))
+    except Exception:
+        ncpu = None
+    procs, me = [], os.getpid()
+    try:
+        lines = subprocess.check_output(["ps", "-Aro", "pid,pcpu,comm"], text=True,
+                                        stderr=subprocess.DEVNULL).splitlines()[1:]
+        for line in lines[:8]:
+            parts = line.split(None, 2)
+            if len(parts) == 3 and int(parts[0]) != me:
+                procs.append((float(parts[1]), parts[2].rsplit("/", 1)[-1]))
+    except Exception:
+        pass
+    return load1, ncpu, procs
+
+
+def load_state():
+    """Machine load as a JSON-serialisable dict, to store beside the results."""
+    load1, ncpu, procs = machine_load()
+    return dict(load_1min=load1, ncpu=ncpu,
+                load_per_core=(load1 / ncpu if load1 is not None and ncpu else None),
+                busiest=[dict(pcpu=pc, name=nm) for pc, nm in procs[:5]],
+                busy=bool(busy_reasons(load1, ncpu, procs)),
+                busy_reasons=busy_reasons(load1, ncpu, procs))
+
+
+def busy_reasons(load1, ncpu, procs):
+    why = []
+    for pcpu, name in procs:
+        if pcpu >= BUSY_PROC_PCT and name not in DISPLAY_PROCS:
+            why.append(f"{name} is using {pcpu:.1f}% CPU")
+    display = sum(pc for pc, nm in procs if nm in DISPLAY_PROCS) / 100.0
+    if (load1 is not None and ncpu
+            and load1 - display > BUSY_LOAD_FRAC * ncpu):
+        why.append(f"1-minute load average {load1:.2f} on {ncpu} cores")
+    return why
+
+
+def report_load(when="before the measurement"):
+    """Print machine state, warn if busy, and return the state dict."""
+    st = load_state()
+    if st["load_1min"] is not None and st["ncpu"]:
+        print(f"machine load : 1-minute {st['load_1min']:.2f} on {st['ncpu']} cores "
+              f"({100 * st['load_per_core']:.0f}%)")
+    if st["busiest"]:
+        print("busiest      : " + ", ".join(
+            f"{b['name']} {b['pcpu']:.1f}%" for b in st["busiest"][:3]))
+    if st["busy"]:
+        print()
+        print("  " + "!" * 70)
+        print(f"  WARNING -- this machine is busy {when}. Every bandwidth number")
+        print("  below is a floor, and reproducibility will be poor.")
+        for r in st["busy_reasons"]:
+            print(f"    - {r}")
+        print("  CPU and GPU share one memory controller, so a process that moves")
+        print("  data subtracts directly from what is measured here. Wait for the")
+        print("  machine to go idle and run again.")
+        print("  " + "!" * 70)
+    return st
+
+
+# ----------------------------------------------------------------------------
 # 1 + 2. Matched filter, MLX, batched -- mirrors matched_filter_benchmark-mlx-single.py
 # ----------------------------------------------------------------------------
 def time_filter(mx, ifft, device, n, list_size, n_unique=20):
@@ -501,6 +598,7 @@ def _kernels(mx, ifft, pairs, prods):
 
 
 def run_decompose(mx, ifft, args):
+    load_before = load_state()
     n = args.array_size
     unit = n * 8
     k = args.n_unique
@@ -622,8 +720,14 @@ def run_decompose(mx, ifft, args):
                 pass
         except Exception as exc:
             print(f"{nn:12d}   FAILED: {type(exc).__name__}: {exc}")
-    print("\nIgnore sizes below ~2^19: at those the arrays fit closer to cache and the")
-    print("time is dominated by kernel dispatch, not memory traffic.")
+    print("\nRead the sweep above the knee near 2^19; below it the numbers describe")
+    print("cache, not DRAM. Two complex64 arrays of 2^19 elements are 8.4 MB, which")
+    print("fits the 8 MB system level cache of a base M2, so smaller kernels are")
+    print("served from the SLC and run faster than main memory allows.")
+    print("SLC capacity is chip dependent -- 8 MB on a base part, up to 96 MB on an")
+    print("M1 Ultra -- and M3 and later merge the cache pools under Dynamic Caching,")
+    print("so the knee moves. Locate it on the machine in front of you rather than")
+    print("assuming 2^19. (Third-party microbenchmarks; Apple publishes no figures.)")
 
     out = dict(array_size=n, unit_bytes=unit, n_unique=k, rounds=args.rounds,
                times_s=t, implied_units=implied, ceiling_gbs=ceiling,
@@ -632,7 +736,8 @@ def run_decompose(mx, ifft, args):
                compute_peak_derived_gflops=1280 * 2 * 1.398,
                compute_peak_curve=peak_curve, matmul=peak_mm,
                machine_balance_flop_per_byte=peak / ceiling,
-               cpu_ceilings=cpu)
+               cpu_ceilings=cpu,
+               machine_load_before=load_before, machine_load_after=load_state())
     with open(args.decompose_output, "w") as fh:
         json.dump(out, fh, indent=2)
     print(f"\nWrote {args.decompose_output}")
@@ -1160,7 +1265,8 @@ def run_surrogate(args):
                    pe_rows=pe_rows, precision_comparison=comparison,
                    weight_dtype_breakdown={k: dict(n=v[0], bytes=v[1])
                                            for k, v in by_dtype.items()},
-                   weight_precision_probe=weight_probe)
+                   weight_precision_probe=weight_probe,
+                   machine_load_after=load_state())
     out = f"{args.surrogate_prefix}_results_{prec}.json"
     with open(out, "w") as fh:
         json.dump(payload, fh, indent=2)
@@ -1261,6 +1367,7 @@ def main():
     print("=" * 78)
     print(f"host          : {hi['chip']}  |  {hi['ncpu']} cores ({hi['nperf']} perf)  |  {hi['ram_gb']} GB")
     print(f"filter length : 2^{int(np.log2(n))} = {n}  ({n * 8 / 1e6:.1f} MB per complex64 array)")
+    report_load("before the measurement")
     if not (args.decompose or args.surrogate):
         print(f"waveforms     : df = 1/{args.seglen:g} s = {df:g} Hz, "
               f"f in [{args.f_lower:g}, {args.f_final:g}] Hz")
@@ -1345,7 +1452,8 @@ def main():
                    waveform_npts=npts,
                    t_filter_gpu_s=t_gpu, t_filter_cpu1_s=t_cpu, t_waveform_s=t_wf,
                    effective_bw_gbs=bw, host_peak_bw_gbs=args.host_bw,
-                   core_speedup=args.core_speedup, candidates=rows)
+                   core_speedup=args.core_speedup, candidates=rows,
+                   machine_load_after=load_state())
     with open(args.output, "w") as fh:
         json.dump(payload, fh, indent=2)
     print(f"\nWrote {args.output}")

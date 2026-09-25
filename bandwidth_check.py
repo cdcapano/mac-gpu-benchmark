@@ -32,6 +32,7 @@ USAGE
 
 import argparse
 import math
+import os
 import platform
 import subprocess
 import time
@@ -54,6 +55,115 @@ def host_info():
     mem = sysctl("hw.memsize")
     ram = f"{int(mem) / 1e9:.0f} GB" if mem.isdigit() else "? GB"
     return chip, ncpu, ram
+
+
+# A background process that streams memory steals bandwidth from the GPU.
+# Measured on an M3 Pro (25 Sep 2026): with Mail and Spotlight indexing between
+# them saturating two cores, this script reported 96-118 GB/s across repeats;
+# with the machine idle it reported 125-127 GB/s, reproducing to 1.4%.
+#
+# CPU percentage is a proxy rather than the quantity that matters. Two pure
+# spin loops at 100% CPU, which touch no memory, changed the result by under
+# 2% on the same machine. So these thresholds are deliberately conservative:
+# they flag a machine worth re-checking, and they do not license correcting a
+# number upward by some assumed factor.
+# Processes excluded from raising the alarm. Terminal emulators and the window
+# server burn CPU rendering this script's own output, so they fire on a machine
+# that is otherwise idle. They are still listed, since a genuinely busy display
+# does cost bandwidth -- they just do not by themselves mean "come back later".
+DISPLAY_PROCS = {"WindowServer", "Terminal", "iTerm2", "kitty", "Alacritty",
+                 "WezTerm", "Ghostty", "claude", "node"}
+
+BUSY_PROC_PCT = 20.0     # any one process at or above this is worth a warning
+BUSY_LOAD_FRAC = 0.30    # 1-minute load average as a fraction of the core count
+
+
+def machine_load():
+    """1-minute load average, core count, and the busiest few processes.
+
+    Returns (load1, ncpu, [(pcpu, name), ...]) with None or [] for anything
+    that could not be read. This process is excluded from the list, since the
+    benchmark itself is expected to be busy.
+    """
+    def sysctl(key):
+        try:
+            return subprocess.run(["sysctl", "-n", key], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+
+    load1 = None
+    raw = sysctl("vm.loadavg")            # looks like: { 1.72 2.04 2.93 }
+    try:
+        load1 = float(raw.strip("{} ").split()[0])
+    except Exception:
+        pass
+
+    ncpu = None
+    try:
+        ncpu = int(sysctl("hw.ncpu"))
+    except Exception:
+        pass
+
+    procs, me = [], os.getpid()
+    try:
+        lines = subprocess.run(["ps", "-Aro", "pid,pcpu,comm"], capture_output=True,
+                               text=True, timeout=5).stdout.splitlines()[1:]
+        for line in lines[:8]:
+            parts = line.split(None, 2)
+            if len(parts) == 3 and int(parts[0]) != me:
+                procs.append((float(parts[1]), parts[2].rsplit("/", 1)[-1]))
+    except Exception:
+        pass
+    return load1, ncpu, procs
+
+
+def load_summary(load1, ncpu, procs):
+    """One line describing the machine state, for printing next to the result."""
+    bits = []
+    if load1 is not None and ncpu:
+        bits.append(f"1-minute load {load1:.2f} on {ncpu} cores "
+                    f"({100 * load1 / ncpu:.0f}%)")
+    elif load1 is not None:
+        bits.append(f"1-minute load {load1:.2f}")
+    if procs:
+        bits.append(f"busiest process {procs[0][1]} at {procs[0][0]:.1f}%")
+    return "; ".join(bits) if bits else "machine state unavailable"
+
+
+def busy_reasons(load1, ncpu, procs):
+    """Why this machine looks too busy to measure on. Empty list means quiet."""
+    why = []
+    for pcpu, name in procs:
+        if pcpu >= BUSY_PROC_PCT and name not in DISPLAY_PROCS:
+            why.append(f"{name} is using {pcpu:.1f}% CPU")
+    display = sum(pc for pc, nm in procs if nm in DISPLAY_PROCS) / 100.0
+    if (load1 is not None and ncpu
+            and load1 - display > BUSY_LOAD_FRAC * ncpu):
+        why.append(f"the 1-minute load average is {load1:.2f} on {ncpu} cores")
+    return why
+
+
+def warn_if_busy(load1, ncpu, procs, when):
+    """Print a warning if the machine is busy. Returns True if it was."""
+    why = busy_reasons(load1, ncpu, procs)
+    if not why:
+        return False
+    print()
+    print("    " + "*" * 64)
+    print(f"    WARNING -- this machine is busy {when}.")
+    for reason in why:
+        print(f"      - {reason}")
+    print("    On Apple Silicon the CPU and the GPU share one memory")
+    print("    controller, so a background process that moves a lot of data")
+    print("    subtracts directly from the bandwidth measured here. Spotlight")
+    print("    indexing cost about a quarter of the figure on an M3 Pro.")
+    print("    How much a given process costs depends on how much memory it")
+    print("    touches, so the only fix is to wait for the machine to go idle")
+    print("    and run this again.")
+    print("    " + "*" * 64)
+    print()
+    return True
 
 
 def make_pairs(mx, n, k, seed=0):
@@ -156,7 +266,13 @@ def main():
           f"= {bytes_per_array / 1e6:.1f} MB each")
     print(f"memory used : about {working_set / 1e6:.0f} MB, freed when this exits")
     print(f"writes      : none -- this script does not create any files")
+    load1, nload, procs = machine_load()
+    print(f"machine load: {load_summary(load1, nload, procs)}")
+    if procs:
+        busiest = ", ".join(f"{nm} {pc:.1f}%" for pc, nm in procs[:3])
+        print(f"busiest     : {busiest}")
     print()
+    warn_if_busy(load1, nload, procs, "before the measurement")
 
     mx.set_default_device(mx.gpu)
 
@@ -211,11 +327,25 @@ def main():
                 print(f"    2^{e:<10d} failed: {type(exc).__name__}: {exc}")
         print()
 
+    load1b, nloadb, procsb = machine_load()
+    busy_after = warn_if_busy(load1b, nloadb, procsb, "after the measurement")
+
     print(BAR)
     print("SUMMARY")
     print(BAR)
     print(f"{chip}: {gbs:.1f} GB/s memory bandwidth"
           + (f", {gflops:.0f} GFLOP/s fp32" if gflops else ""))
+    # The machine state belongs with the number. A figure recorded without it
+    # cannot be compared against one taken on a different machine, or later on
+    # the same machine.
+    print(f"measured with {load_summary(load1b, nloadb, procsb)}")
+    if busy_after or busy_reasons(load1, nload, procs):
+        print("TREAT THIS FIGURE AS A FLOOR -- the machine was busy, see the")
+        print("warning above. The true bandwidth of this chip is higher.")
+    else:
+        print("No competing workload was detected, so this figure is usable as")
+        print("measured. Window server and terminal activity is expected during a")
+        print("run and is excluded from that check; it costs a few percent.")
     print("Nothing was written to disk. Quit Terminal and no trace remains.")
     return 0
 
